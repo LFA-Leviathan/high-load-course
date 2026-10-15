@@ -3,10 +3,14 @@ package ru.quipy.apigateway
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.http.HttpHeaders
+import org.springframework.http.HttpStatus
+import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
 import java.util.*
+import java.util.concurrent.RejectedExecutionException
 
 @RestController
 class APIController {
@@ -71,4 +75,12 @@ class APIController {
         val timestamp: Long,
         val transactionId: UUID
     )
+
+    // The tester reads Retry-After as epoch millis: it pauses new tests until then and restarts the rejected one later.
+    // A slot frees about every second (4.9 s / 5 parallel requests).
+    @ExceptionHandler(RejectedExecutionException::class)
+    fun onPaymentQueueFull(): ResponseEntity<Unit> =
+        ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+            .header(HttpHeaders.RETRY_AFTER, (System.currentTimeMillis() + 1000).toString())
+            .build()
 }
