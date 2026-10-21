@@ -14,6 +14,8 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 
 // Advice: always treat time as a Duration
@@ -41,6 +43,10 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
+    // tickBlocking() polls with sleep, so a waiting thread may lose to newer ones for seconds.
+    // The fair lock makes threads take rate limiter permits in arrival order.
+    private val rateLimiterLock = ReentrantLock(true)
+
     private val parallelLimiter = Semaphore(parallelRequests, true)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -66,7 +72,7 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         try {
-            rateLimiter.tickBlocking()
+            rateLimiterLock.withLock { rateLimiter.tickBlocking() }
 
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
