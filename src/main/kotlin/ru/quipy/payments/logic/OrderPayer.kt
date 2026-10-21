@@ -32,15 +32,15 @@ class OrderPayer(meterRegistry: MeterRegistry) {
     private val incomingPayments = meterRegistry.counter("shop.payments", "stage", "incoming")
     private val rejectedPayments = meterRegistry.counter("shop.payments", "stage", "rejected")
 
-    // Back pressure: at most 16 + 24 = 40 accepted payments at once. acc-5 finishes ~1 payment/s
-    // (5 parallel requests / 4.9 s), so the last of them is done in ~40 s, well before the 60 s deadline.
+    // acc-5 finishes ~1 payment/s (5 parallel requests / 4.9 s), the test sends 2/s: the queue grows ~1/s
+    // and late payments miss the deadline. Code can't fix it, the account has to be upgraded (see the case report).
     // When the queue is full, the payment is rejected and the client gets 429 (see APIController).
     private val paymentExecutor = ThreadPoolExecutor(
         16,
         16,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(24),
+        LinkedBlockingQueue(8_000),
         NamedThreadFactory("payment-submission-executor"),
         RejectedExecutionHandler { _, _ ->
             rejectedPayments.increment()
