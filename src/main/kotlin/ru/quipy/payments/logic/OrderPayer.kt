@@ -32,11 +32,6 @@ class OrderPayer(meterRegistry: MeterRegistry) {
     private val incomingPayments = meterRegistry.counter("shop.payments", "stage", "incoming")
     private val rejectedPayments = meterRegistry.counter("shop.payments", "stage", "rejected")
 
-    // acc-18 takes 110 payments/s, a payment lasts 0..2 s (1 s on average), the deadline is 3 s.
-    // Threads: ~110 payments are in flight at once (110/s * 1 s), 140 leaves room for slow ones.
-    // Buffer: the spare threads (waiting for the rate limiter) plus the queue hold ~100 payments = ~0.9 s of work,
-    // so a buffered payment still has >= 2 s left for the provider call.
-    // When the buffer is full, the payment is rejected and the client gets 429 (see APIController).
     private val paymentExecutor = ThreadPoolExecutor(
         140,
         140,

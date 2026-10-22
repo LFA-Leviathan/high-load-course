@@ -43,8 +43,6 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
-    // tickBlocking() polls with sleep, so a waiting thread may lose to newer ones for seconds.
-    // The fair lock makes threads take rate limiter permits in arrival order.
     private val rateLimiterLock = ReentrantLock(true)
 
     private val parallelLimiter = Semaphore(parallelRequests, true)
