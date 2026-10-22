@@ -76,11 +76,9 @@ class APIController {
         val transactionId: UUID
     )
 
-    // The tester reads Retry-After as epoch millis: it pauses new tests until then and restarts the rejected one later.
-    // A slot frees about every second (4.9 s / 5 parallel requests).
     @ExceptionHandler(RejectedExecutionException::class)
     fun onPaymentQueueFull(): ResponseEntity<Unit> =
         ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-            .header(HttpHeaders.RETRY_AFTER, (System.currentTimeMillis() + 1000).toString())
+            .header(HttpHeaders.RETRY_AFTER, (System.currentTimeMillis() + 500).toString())
             .build()
 }
