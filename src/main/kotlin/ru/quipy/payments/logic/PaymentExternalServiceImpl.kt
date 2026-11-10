@@ -4,13 +4,18 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
+import okhttp3.Response
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.IOException
+import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
@@ -24,8 +29,10 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
-    meterRegistry: MeterRegistry,
+    private val meterRegistry: MeterRegistry,
     private val expectedProcessingTimeMs: Long = 0L,
+    private val maxAttempts: Int = 2,
+    private val retryBackoffMs: Long = 100L,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -34,61 +41,80 @@ class PaymentExternalSystemAdapterImpl(
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
 
-        /** Шаг опроса лимитера. */
-        private const val RATE_WAIT_STEP_MS = 5L
+        /** Резерв бюджета на запись результата в event store и доставку ответа клиенту. */
+        private const val SUBMISSION_RESERVE_MS = 400L
 
-        /**
-         * Резерв бюджета, который нельзя отдавать под ожидание окна: запись результата
-         * в event store и доставка ответа клиенту после ответа платёжной системы.
-         */
-        private const val SUBMISSION_RESERVE_MS = 300L
+        /** Минимальный бюджет попытки: меньше — гарантированный провал. */
+        private const val MIN_ATTEMPT_BUDGET_MS = 50L
 
-        /**
-         * Страховочный потолок ожидания окна — защита от некорректного дедлайна от клиента.
-         * Рабочее ограничение вычисляется из дедлайна, см. [awaitRatePermission].
-         */
-        private const val RATE_WAIT_CEILING_MS = 30_000L
+        /** Потолок времени одного HTTP-вызова: защита от зависшего соединения. */
+        private const val CALL_TIMEOUT_CEILING_MS = 30_000L
 
-        /** Минимальный бюджет ожидания слота: лучше отправить запрос с малым запасом, чем гарантированно провалить его. */
-        private const val MIN_WAIT_BUDGET_MS = 50L
-
-        /**
-         * Максимальное ожидание слота параллелизма.
-         *
-         * Слотов столько же, сколько параллельных запросов у аккаунта (64), а каждый вызов
-         * держит слот ~1.2 с.
-         */
-        private const val SLOT_WAIT_MAX_MS = 5_000L
-
-        /** Вес предыдущей оценки в экспоненциальном сглаживании. */
+        /** Вес предыдущей оценки в экспоненциальном сглаживании наблюдаемого времени ответа ПС. */
         private const val EWMA_PREVIOUS_WEIGHT = 4L
 
-        /**
-         * Пределы диспетчера OkHttp. Подняты, чтобы обеспечить
-         * in-flight, необходимый для полной утилизации: 11 rps × 13 с = 143 запроса.
-         */
+        /** Верхняя граница паузы между попытками. */
+        private const val RETRY_BACKOFF_MAX_MS = 400L
+
+        /** Пауза перед повтором, если ПС ответил 429 без `Retry-After`. */
+        private const val DEFAULT_RETRY_AFTER_MS = 250L
+
+        /** Пределы диспетчера OkHttp под in-flight, равный лимиту аккаунта. */
         private const val DISPATCHER_MAX_REQUESTS = 512
         private const val DISPATCHER_MAX_REQUESTS_PER_HOST = 256
+
+        private const val CONNECT_TIMEOUT_MS = 2_000L
+        private const val WRITE_TIMEOUT_MS = 5_000L
     }
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
-    private val rateLimitPerSec = properties.rateLimitPerSec
-    private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .dispatcher(
+            Dispatcher().apply {
+                maxRequests = DISPATCHER_MAX_REQUESTS
+                maxRequestsPerHost = DISPATCHER_MAX_REQUESTS_PER_HOST
+            }
+        )
+        .connectTimeout(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .writeTimeout(WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .build()
 
     private val rateLimiter = SlidingWindowRateLimiter(
-        rateLimitPerSec.toLong(),
+        properties.rateLimitPerSec.toLong(),
         Duration.ofSeconds(1)
     )
 
-    private val parallelLimiter = Semaphore(parallelRequests, true)
+    private val parallelLimiter = Semaphore(properties.parallelRequests, true)
 
-    private val deadlineDrops = meterRegistry.counter("payment_dropped_total", "reason", "deadline")
-    private val slotDrops = meterRegistry.counter("payment_dropped_total", "reason", "slot")
-    private val rateWaitDrops = meterRegistry.counter("payment_dropped_total", "reason", "rate_wait")
+    private val rateWaitTimer = Timer.builder("payment_wait_seconds")
+        .tag("account", accountName)
+        .tag("stage", "rate")
+        .register(meterRegistry)
+    private val slotWaitTimer = Timer.builder("payment_wait_seconds")
+        .tag("account", accountName)
+        .tag("stage", "slot")
+        .register(meterRegistry)
+    private val processingTimer = Timer.builder("payment_processing_seconds")
+        .tag("account", accountName)
+        .register(meterRegistry)
 
+    private val submissionLogTimer = Timer.builder("payment_stage_seconds")
+        .tag("account", accountName)
+        .tag("stage", "log_submission")
+        .register(meterRegistry)
+
+    private val processingLogTimer = Timer.builder("payment_stage_seconds")
+        .tag("account", accountName)
+        .tag("stage", "log_processing")
+        .register(meterRegistry)
+
+    private val e2eTimer = Timer.builder("payment_e2e_seconds")
+        .tag("account", accountName)
+        .register(meterRegistry)
+
+    /** Наблюдаемое время ответа ПС (EWMA): по нему решается, влезает ли ещё одна попытка. */
     private val observedProcessingMs = AtomicLong(initialProcessingEstimate())
 
     private fun initialProcessingEstimate(): Long {
@@ -98,6 +124,8 @@ class PaymentExternalSystemAdapterImpl(
 
     private fun observeProcessingMs(durationMs: Long) {
         if (durationMs <= 0) return
+        processingTimer.record(durationMs, TimeUnit.MILLISECONDS)
+
         while (true) {
             val previous = observedProcessingMs.get()
             val next = if (previous <= 0) {
@@ -105,119 +133,267 @@ class PaymentExternalSystemAdapterImpl(
             } else {
                 (previous * EWMA_PREVIOUS_WEIGHT + durationMs) / (EWMA_PREVIOUS_WEIGHT + 1)
             }
-            if (observedProcessingMs.compareAndSet(previous, next)) return
+            if (observedProcessingMs.compareAndSet(previous, next)) break
         }
     }
 
     /**
-     * Ожидание разрешения выходного окна, ограниченное самим дедлайном.
+     * Остаток бюджета клиента за вычетом резерва на доставку результата.
+     * Значение <= 0 означает, что отправлять (или повторять) уже поздно.
      */
-    private fun awaitRatePermission(budgetMs: Long): Boolean {
-        val reserveMs = observedProcessingMs.get() + SUBMISSION_RESERVE_MS
-        val maxWaitMs = (budgetMs - reserveMs).coerceIn(0L, RATE_WAIT_CEILING_MS)
-        val waitDeadline = now() + maxWaitMs
-        while (true) {
-            if (rateLimiter.tick()) return true
-            if (now() >= waitDeadline) return false
-            Thread.sleep(RATE_WAIT_STEP_MS)
+    private fun remainingBudgetMs(deadline: Long): Long = deadline - now() - SUBMISSION_RESERVE_MS
+
+    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        val startedAt = now()
+        try {
+            submitWithRetries(paymentId, amount, paymentStartedAt, deadline)
+        } finally {
+            e2eTimer.record(now() - startedAt, TimeUnit.MILLISECONDS)
         }
     }
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    private fun submitWithRetries(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-val transactionId = UUID.randomUUID()
 
-        // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-        // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-        }
-
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-
-        val budgetMs = deadline - now()
-        if (budgetMs <= 0) {
-            dropPayment(
+        // Платёж, которому не хватает бюджета ещё до попытки, не отправляем:
+        // иначе деньги за попытку спишутся, а клиент всё равно увидит CLIENT_TIMEOUT.
+        if (remainingBudgetMs(deadline) <= 0) {
+            logTerminalFailure(
                 paymentId,
-                transactionId,
-                deadlineDrops,
-                "Deadline exceeded before submission, request not sent"
+                null,
+                "Deadline exceeded before submission, request not sent",
+                "deadline"
             )
             return
         }
 
-        // Acquire the egress permission first. Waiting for the rate window
-        // must not occupy one of the 64 provider concurrency slots.
-        if (!awaitRatePermission(budgetMs)) {
-            dropPayment(paymentId, transactionId, rateWaitDrops, "Rate limit wait exceeded, request not sent")
-            return
-        }
+        var attempt = 0
+        while (true) {
+            attempt++
+            val transactionId = UUID.randomUUID()
 
-        // Ожидание слота ограничено константой, а не остатком дедлайна: при дедлайне 26 с
-        // формула budget - observed давала до 24.5 с на поток, из-за чего пул заполнялся
-        // ожидающими и клиент получал 429 от RejectedExecutionHandler.
-        val waitBudgetMs = minOf(deadline - now() - observedProcessingMs.get(), SLOT_WAIT_MAX_MS)
-            .coerceAtLeast(MIN_WAIT_BUDGET_MS)
-        if (!parallelLimiter.tryAcquire(waitBudgetMs, TimeUnit.MILLISECONDS)) {
-            dropPayment(paymentId, transactionId, slotDrops, "Deadline would be missed, request not sent")
-            return
-        }
-
-        try {
-            val sentAt = now()
-
-            val request = Request.Builder().run {
-                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                post(emptyBody)
-            }.build()
-
-            client.newCall(request).execute().use { response ->
-                observeProcessingMs(now() - sentAt)
-
-                val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                }
-
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+            // Вне зависимости от исхода оплаты важно отметить, что она была отправлена.
+            // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
+            val submissionLogStart = now()
+            try {
                 paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                    it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
                 }
+            } catch (e: Exception) {
+                logger.error("[$accountName] Failed to log submission for payment $paymentId, txId: $transactionId", e)
+            } finally {
+                submissionLogTimer.record(now() - submissionLogStart, TimeUnit.MILLISECONDS)
+            }
+
+            logger.info("[$accountName] Submit: $paymentId , txId: $transactionId, attempt: $attempt")
+
+            val rateWaitStart = now()
+            rateLimiter.tickBlocking()
+            rateWaitTimer.record(now() - rateWaitStart, TimeUnit.MILLISECONDS)
+
+            val slotWaitStart = now()
+            parallelLimiter.acquire()
+            slotWaitTimer.record(now() - slotWaitStart, TimeUnit.MILLISECONDS)
+
+            val outcome = try {
+                callProvider(paymentId, amount, transactionId, deadline)
+            } finally {
+                parallelLimiter.release()
+            }
+
+            attemptCounter(attempt, if (outcome.success) "success" else "failed").increment()
+
+            if (outcome.success) {
+                logger.warn(
+                    "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
+                            "succeeded: true, attempt: $attempt, message: ${outcome.reason}"
+                )
+                finish(paymentId, transactionId, true, outcome.reason, "success")
+                return
+            }
+
+            logger.warn(
+                "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
+                        "succeeded: false, attempt: $attempt, retriable: ${outcome.retriable}, message: ${outcome.reason}"
+            )
+
+            if (attempt >= maxAttempts || !outcome.retriable) {
+                finish(paymentId, transactionId, false, outcome.reason, outcome.kind)
+                return
+            }
+
+            // Пауза перед повтором: `Retry-After` от ПС либо линейный backoff.
+            val backoffMs = outcome.retryAfterMs
+                ?: minOf(retryBackoffMs * attempt, RETRY_BACKOFF_MAX_MS)
+
+            // Повтор имеет смысл, только если остатка бюджета хватает ещё на один вызов ПС.
+            if (remainingBudgetMs(deadline) <= observedProcessingMs.get() + backoffMs) {
+                logger.warn(
+                    "[$accountName] No budget for retry for payment $paymentId: " +
+                            "remaining=${remainingBudgetMs(deadline)} ms, needed=${observedProcessingMs.get() + backoffMs} ms"
+                )
+                finish(paymentId, transactionId, false, "${outcome.reason} (no budget for retry)", outcome.kind)
+                return
+            }
+
+            retryCounter(outcome.kind).increment()
+            logger.warn("[$accountName] Retrying payment $paymentId after ${backoffMs} ms, reason: ${outcome.kind}")
+            if (backoffMs > 0) Thread.sleep(backoffMs)
+        }
+    }
+
+    /**
+     * Один вызов платёжной системы. Время вызова ограничено остатком дедлайна клиента,
+     * чтобы зависшее соединение не съело бюджет и не удерживало слот.
+     */
+    private fun callProvider(paymentId: UUID, amount: Int, transactionId: UUID, deadline: Long): AttemptOutcome {
+        val callBudgetMs = remainingBudgetMs(deadline)
+            .coerceIn(MIN_ATTEMPT_BUDGET_MS, CALL_TIMEOUT_CEILING_MS)
+
+        val request = Request.Builder().run {
+            url(
+                "http://$paymentProviderHostPort/external/process" +
+                        "?serviceName=$serviceName&token=$token&accountName=$accountName" +
+                        "&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
+            )
+            post(emptyBody)
+        }.build()
+
+        val sentAt = now()
+        return try {
+            client.newBuilder()
+                .callTimeout(callBudgetMs, TimeUnit.MILLISECONDS)
+                .build()
+                .newCall(request)
+                .execute()
+                .use { response ->
+                    observeProcessingMs(now() - sentAt)
+                    interpret(response)
+                }
+        } catch (e: SocketTimeoutException) {
+            observeProcessingMs(now() - sentAt)
+            AttemptOutcome(false, "Request timeout.", retriable = true, kind = "timeout")
+        } catch (e: InterruptedIOException) {
+            observeProcessingMs(now() - sentAt)
+            AttemptOutcome(false, "Request timeout (call deadline).", retriable = true, kind = "timeout")
+        } catch (e: IOException) {
+            observeProcessingMs(now() - sentAt)
+            AttemptOutcome(false, e.message ?: e.javaClass.simpleName, retriable = true, kind = "io")
+        } catch (e: Exception) {
+            observeProcessingMs(now() - sentAt)
+            logger.error("[$accountName] Unexpected payment failure for txId: $transactionId, payment: $paymentId", e)
+            AttemptOutcome(false, e.message ?: e.javaClass.simpleName, retriable = false, kind = "unexpected")
+        }
+    }
+
+    private fun interpret(response: Response): AttemptOutcome {
+        val bodyText = try {
+            response.body?.string()
+        } catch (e: Exception) {
+            null
+        }
+
+        val parsed = bodyText?.let { raw ->
+            runCatching { mapper.readValue(raw, ExternalSysResponse::class.java) }.getOrNull()
+        }
+
+        if (parsed != null && response.isSuccessful) {
+            if (parsed.result) {
+                return AttemptOutcome(
+                    success = true,
+                    reason = parsed.message,
+                    retriable = false,
+                    kind = "success",
+                )
+            }
+
+            return AttemptOutcome(
+                success = false,
+                reason = parsed.message,
+                retriable = true,
+                kind = "declined",
+                retryAfterMs = 0L,
+            )
+        }
+
+        val retriable = isRetriableStatus(response.code)
+        val reason = parsed?.message ?: "HTTP ${response.code}: ${bodyText?.take(200)}"
+        return AttemptOutcome(
+            success = false,
+            reason = reason,
+            retriable = retriable,
+            kind = kindOfStatus(response.code),
+            retryAfterMs = if (response.code == 429) parseRetryAfterMs(response) else null,
+        )
+    }
+
+    private fun isRetriableStatus(status: Int): Boolean =
+        status == 429 || status == 500 || status == 502 || status == 503 || status == 504
+
+    private fun kindOfStatus(status: Int): String = when {
+        status == 429 -> "http_429"
+        status in 500..599 -> "http_5xx"
+        else -> "http_$status"
+    }
+
+    /** `Retry-After` отдаётся в секундах; ограничиваем паузу разумным диапазоном. */
+    private fun parseRetryAfterMs(response: Response): Long {
+        val header = response.header("Retry-After")
+        val seconds = header?.trim()?.toLongOrNull()
+        val result = if (seconds != null) {
+            seconds * 1000L
+        } else {
+            DEFAULT_RETRY_AFTER_MS
+        }
+        return result.coerceIn(0L, RETRY_BACKOFF_MAX_MS * 10)
+    }
+
+    private fun finish(paymentId: UUID, transactionId: UUID, success: Boolean, reason: String?, label: String) {
+        outcomeCounter(success, label).increment()
+        val processingLogStart = now()
+        try {
+            // Результат пишется ровно один раз — по финальному исходу платежа.
+            paymentESService.update(paymentId) {
+                it.logProcessing(success, now(), transactionId, reason = reason)
             }
         } catch (e: Exception) {
-            when (e) {
-                is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                    }
-                }
-
-                else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
-                    }
-                }
-            }
+            logger.error("[$accountName] Failed to store payment result for payment $paymentId, txId: $transactionId", e)
         } finally {
-            parallelLimiter.release()
+            processingLogTimer.record(now() - processingLogStart, TimeUnit.MILLISECONDS)
         }
     }
 
-    private fun dropPayment(paymentId: UUID, transactionId: UUID, counter: Counter, reason: String) {
-        counter.increment()
-        logger.error("[$accountName] Payment $paymentId dropped: $reason, txId: $transactionId")
-        paymentESService.update(paymentId) {
-            it.logProcessing(false, now(), transactionId, reason = reason)
+    /** Терминальный исход без отправки запроса (бюджет исчерпан ещё до попытки). */
+    private fun logTerminalFailure(paymentId: UUID, transactionId: UUID?, reason: String, label: String) {
+        outcomeCounter(false, label).increment()
+        logger.error("[$accountName] Payment $paymentId dropped: $reason")
+        try {
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = reason)
+            }
+        } catch (e: Exception) {
+            logger.error("[$accountName] Failed to store drop result for payment $paymentId", e)
         }
     }
+
+    private fun attemptCounter(attempt: Int, outcome: String): Counter =
+        meterRegistry.counter(
+            "payment_attempts",
+            "account", accountName,
+            "attempt", attempt.toString(),
+            "outcome", outcome,
+        )
+
+    private fun retryCounter(reason: String): Counter =
+        meterRegistry.counter("payment_retry", "account", accountName, "reason", reason)
+
+    private fun outcomeCounter(success: Boolean, label: String): Counter =
+        meterRegistry.counter(
+            "shop_payment_finished",
+            "account", accountName,
+            "outcome", if (success) "SUCCESS" else "FAIL",
+            "failReason", label,
+        )
 
     override fun price() = properties.price
 
@@ -225,6 +401,13 @@ paymentESService.update(paymentId) {
 
     override fun name() = properties.accountName
 
+    private data class AttemptOutcome(
+        val success: Boolean,
+        val reason: String?,
+        val retriable: Boolean,
+        val kind: String,
+        val retryAfterMs: Long? = null,
+    )
 }
 
 fun now() = System.currentTimeMillis()

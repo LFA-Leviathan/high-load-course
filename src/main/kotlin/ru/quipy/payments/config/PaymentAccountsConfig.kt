@@ -36,6 +36,12 @@ class PaymentAccountsConfig {
     @Value("\${payment.expected-processing-time-ms}")
     var expectedProcessingTimeMs: Long = 0L
 
+    @Value("\${payment.retry.max-attempts:2}")
+    var maxAttempts: Int = 2
+
+    @Value("\${payment.retry.backoff-ms:100}")
+    var retryBackoffMs: Long = 100L
+
     @Value("#{'\${payment.accounts}'.split(',')}")
     lateinit var allowedAccounts: List<String>
 
@@ -66,7 +72,9 @@ class PaymentAccountsConfig {
                     paymentProviderHostPort,
                     token,
                     meterRegistry,
-                    expectedProcessingTimeMs
+                    expectedProcessingTimeMs,
+                    maxAttempts,
+                    retryBackoffMs,
                 )
             }
     }

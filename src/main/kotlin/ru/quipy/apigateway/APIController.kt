@@ -82,7 +82,7 @@ class APIController {
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
         val remainingMs = deadline - System.currentTimeMillis()
         if (remainingMs < MIN_REMAINING_BUDGET_MS) {
-            logger.warn("Payment for order $orderId rejected by deadline guard: remaining={} ms", remainingMs)
+            logger.warn("Payment for order $orderId rejected by deadline guard: only {} ms left", remainingMs)
             return tooManyRequests()
         }
 

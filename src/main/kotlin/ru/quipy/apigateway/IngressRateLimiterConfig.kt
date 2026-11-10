@@ -47,8 +47,7 @@ class IngressRateLimiterConfig {
         val shortLimiter = createLimiter(bucketSize)
         val longLimiter = createLimiter(longBucketSize)
         logger.warn(
-            "Ingress rate limiter enabled: type={}, rate={}, window={}s, " +
-                "bucket(short deadline)={}, bucket(long deadline)={}",
+            "Ingress rate limiter enabled: type={}, rate={} rps, window={}s, bucket(short deadline)={}, bucket(long deadline)={}",
             rateLimiterType, rate, windowSeconds, bucketSize, longBucketSize
         )
         return IngressRateLimiter(
@@ -63,9 +62,11 @@ class IngressRateLimiterConfig {
 
         "fixed" -> FixedWindowRateLimiter(rate, windowSeconds, TimeUnit.SECONDS)
 
-        "token-bucket" -> TokenBucketRateLimiter(rate, maxOf(burstCapacity, configuredBucketSize), windowSeconds, TimeUnit.SECONDS)
+        "token-bucket" ->
+            TokenBucketRateLimiter(rate, maxOf(burstCapacity, configuredBucketSize), windowSeconds, TimeUnit.SECONDS)
 
-        "leaking-bucket" -> LeakingBucketRateLimiter(rate.toLong(), Duration.ofSeconds(windowSeconds), configuredBucketSize)
+        "leaking-bucket" ->
+            LeakingBucketRateLimiter(rate.toLong(), Duration.ofSeconds(windowSeconds), configuredBucketSize)
 
         "counting" -> CountingRateLimiter(rate, windowSeconds, TimeUnit.SECONDS)
 
