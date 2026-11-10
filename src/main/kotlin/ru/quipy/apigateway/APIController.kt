@@ -1,8 +1,10 @@
 package ru.quipy.apigateway
 
+import jakarta.annotation.PostConstruct
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.beans.factory.annotation.Value
 import org.springframework.http.HttpHeaders
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
@@ -22,6 +24,24 @@ class APIController {
 
     @Autowired
     private lateinit var orderPayer: OrderPayer
+
+    @Autowired
+    private lateinit var ingressRateLimiter: IngressRateLimiter
+
+    @Value("\${ingress.retry-after-ms}")
+    private var retryAfterMs: Long = 0L
+
+    @Value("\${ingress.wait-ms:300}")
+    private var ingressWaitMs: Long = 300L
+
+    @PostConstruct
+    fun logRetryAfterConfiguration() {
+        logger.warn(
+            "Ingress 429 responses use Retry-After: {} second(s) (configured {} ms)",
+            retryAfterMs / 1000L,
+            retryAfterMs
+        )
+    }
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
@@ -59,16 +79,27 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): PaymentSubmissionDto {
+    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
+        val remainingMs = deadline - System.currentTimeMillis()
+        if (remainingMs < MIN_REMAINING_BUDGET_MS) {
+            logger.warn("Payment for order $orderId rejected by deadline guard: remaining={} ms", remainingMs)
+            return tooManyRequests()
+        }
+
+        val longDeadline = remainingMs >= LONG_DEADLINE_THRESHOLD_MS
+        if (!ingressRateLimiter.tryAcquire(ingressWaitMs, longDeadline)) {
+            logger.warn("Payment for order $orderId rejected by ingress rate limiter")
+            return tooManyRequests()
+        }
+
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
             it
         } ?: throw IllegalArgumentException("No such order $orderId")
 
-
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-        return PaymentSubmissionDto(createdAt, paymentId)
+        return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }
 
     class PaymentSubmissionDto(
@@ -76,11 +107,20 @@ class APIController {
         val transactionId: UUID
     )
 
-    // The tester reads Retry-After as epoch millis: it pauses new tests until then and restarts the rejected one later.
-    // A slot frees about every second (4.9 s / 5 parallel requests).
+    companion object {
+        private const val MIN_REMAINING_BUDGET_MS = 300L
+
+        private const val LONG_DEADLINE_THRESHOLD_MS = 20_000L
+    }
+
     @ExceptionHandler(RejectedExecutionException::class)
     fun onPaymentQueueFull(): ResponseEntity<Unit> =
         ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-            .header(HttpHeaders.RETRY_AFTER, (System.currentTimeMillis() + 1000).toString())
+            .header(HttpHeaders.RETRY_AFTER, (retryAfterMs / 1000L).toString())
+            .build()
+
+    private fun tooManyRequests(): ResponseEntity<PaymentSubmissionDto> =
+        ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+            .header(HttpHeaders.RETRY_AFTER, (retryAfterMs / 1000L).toString())
             .build()
 }

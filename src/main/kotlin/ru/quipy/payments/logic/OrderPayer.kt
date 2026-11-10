@@ -32,15 +32,12 @@ class OrderPayer(meterRegistry: MeterRegistry) {
     private val incomingPayments = meterRegistry.counter("shop.payments", "stage", "incoming")
     private val rejectedPayments = meterRegistry.counter("shop.payments", "stage", "rejected")
 
-    // acc-5 finishes ~1 payment/s (5 parallel requests / 4.9 s), the test sends 2/s: the queue grows ~1/s
-    // and late payments miss the deadline. Code can't fix it, the account has to be upgraded (see the case report).
-    // When the queue is full, the payment is rejected and the client gets 429 (see APIController).
     private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16,
+        256,
+        256,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(8_000),
+        LinkedBlockingQueue(64),
         NamedThreadFactory("payment-submission-executor"),
         RejectedExecutionHandler { _, _ ->
             rejectedPayments.increment()
@@ -50,7 +47,7 @@ class OrderPayer(meterRegistry: MeterRegistry) {
     ).also { ExecutorServiceMetrics(it, "payment-submission-executor", emptyList()).bindTo(meterRegistry) }
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
-        val createdAt = System.currentTimeMillis()
+        val acceptedAt = System.currentTimeMillis()
         incomingPayments.increment()
         paymentExecutor.submit {
             val createdEvent = paymentESService.create {
@@ -62,8 +59,11 @@ class OrderPayer(meterRegistry: MeterRegistry) {
             }
             logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
-            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+            // The external budget starts when the worker is ready to submit,
+            // not when the request was waiting in the local executor queue.
+            val submissionStartedAt = System.currentTimeMillis()
+            paymentService.submitPaymentRequest(paymentId, amount, submissionStartedAt, deadline)
         }
-        return createdAt
+        return acceptedAt
     }
 }
