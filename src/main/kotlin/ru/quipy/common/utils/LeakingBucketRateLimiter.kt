@@ -1,37 +1,53 @@
 package ru.quipy.common.utils
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.time.Duration
-import java.util.concurrent.Executors
-import java.util.concurrent.LinkedBlockingQueue
 
 class LeakingBucketRateLimiter(
     private val rate: Long,
     private val window: Duration,
-    bucketSize: Int,
+    private val bucketSize: Int,
 ) : RateLimiter {
-    private val rateLimiterScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
-    private val queue = LinkedBlockingQueue<Int>(bucketSize)
 
-    override fun tick(): Boolean {
-        return queue.offer(1)
+    init {
+        require(rate > 0) { "rate must be positive" }
+        require(!window.isZero && !window.isNegative) { "window must be positive" }
+        require(bucketSize > 0) { "bucketSize must be positive" }
     }
 
-    private val releaseJob = rateLimiterScope.launch {
-        while (true) {
-            delay(window.toMillis())
-            for (i in 0..rate) {
-                queue.poll()
-            }
+    /** Интервал между допусками: window / rate. */
+    private val intervalNanos: Long = (window.toNanos() / rate).coerceAtLeast(1L)
+
+    /** Запас на залп: bucketSize запросов проходят в пределах bucketSize-1 интервалов. */
+    private val burstToleranceNanos: Long = intervalNanos * (bucketSize - 1)
+
+    private val lock = Any()
+
+    /** Теоретическое время следующего допуска (TAT в GCRA). */
+    private var theoreticalArrivalNanos: Long = System.nanoTime()
+
+    override fun tick(): Boolean = synchronized(lock) {
+        val now = System.nanoTime()
+        // Бакет пуст: допуск возможен, только если с прошлого допуска прошло достаточно времени.
+        if (theoreticalArrivalNanos - now > burstToleranceNanos) {
+            return false
         }
-    }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
+        theoreticalArrivalNanos = maxOf(theoreticalArrivalNanos, now) + intervalNanos
+        return true
+    }
 
     companion object {
         private val logger: Logger = LoggerFactory.getLogger(LeakingBucketRateLimiter::class.java)
+
+        /**
+         * Человекочитаемое описание конфигурации для лога старта.
+         */
+        fun describe(rate: Long, window: Duration, bucketSize: Int): String {
+            val intervalMs = (window.toMillis() / rate).coerceAtLeast(1L)
+            val effectiveRps = 1000.0 / intervalMs
+            return "rate=$rate per $window, interval=$intervalMs ms (~%.2f rps), burst=$bucketSize"
+                .format(effectiveRps)
+        }
     }
 }
