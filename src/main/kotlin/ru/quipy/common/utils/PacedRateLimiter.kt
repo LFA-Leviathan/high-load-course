@@ -18,4 +18,14 @@ class PacedRateLimiter(private val intervalMs: Long) : RateLimiter {
             if (nextSlotMs.compareAndSet(slot, nowMs + intervalMs)) return true
         }
     }
+
+    fun tryAcquireUntil(latestStartMs: Long): Boolean {
+        while (true) {
+            val nowMs = System.currentTimeMillis()
+            val remainingMs = latestStartMs - nowMs
+            if (remainingMs <= 0) return false
+            if (tick()) return true
+            Thread.sleep(minOf(remainingMs, (nextSlotMs.get() - nowMs).coerceAtLeast(1L)))
+        }
+    }
 }

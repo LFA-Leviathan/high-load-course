@@ -39,12 +39,14 @@ class OrderPayer(private val meterRegistry: MeterRegistry) {
 
     private val queueWaitTimer = meterRegistry.timer(
         "payment_stage_seconds",
+        "account", "all",
         "component", "order-payer",
         "stage", "executor_queue"
     )
 
     private val createTimer = meterRegistry.timer(
         "payment_stage_seconds",
+        "account", "all",
         "component", "order-payer",
         "stage", "es_create"
     )
