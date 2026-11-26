@@ -11,7 +11,7 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.PacedRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
@@ -31,9 +31,16 @@ class PaymentExternalSystemAdapterImpl(
     private val token: String,
     private val meterRegistry: MeterRegistry,
     private val expectedProcessingTimeMs: Long = 0L,
-    private val maxAttempts: Int = 2,
+    private val maxAttempts: Int = 4,
     private val retryBackoffMs: Long = 100L,
+    private val attemptTimeoutMs: Long = 1250L,
 ) : PaymentExternalSystemAdapter {
+
+    init {
+        require(maxAttempts >= 1)
+        require(attemptTimeoutMs >= MIN_ATTEMPT_BUDGET_MS)
+        require(retryBackoffMs >= 0)
+    }
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
@@ -81,10 +88,7 @@ class PaymentExternalSystemAdapterImpl(
         .writeTimeout(WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .build()
 
-    private val rateLimiter = SlidingWindowRateLimiter(
-        properties.rateLimitPerSec.toLong(),
-        Duration.ofSeconds(1)
-    )
+    private val rateLimiter = PacedRateLimiter((1000L + properties.rateLimitPerSec - 1) / properties.rateLimitPerSec)
 
     private val parallelLimiter = Semaphore(properties.parallelRequests, true)
 
@@ -98,14 +102,19 @@ class PaymentExternalSystemAdapterImpl(
         .register(meterRegistry)
     private val processingTimer = Timer.builder("payment_processing_seconds")
         .tag("account", accountName)
+        .publishPercentileHistogram()
         .register(meterRegistry)
 
+    private val recoveredPayments = meterRegistry.counter("payment_recovered", "account", accountName)
+
     private val submissionLogTimer = Timer.builder("payment_stage_seconds")
+        .tag("component", "provider")
         .tag("account", accountName)
         .tag("stage", "log_submission")
         .register(meterRegistry)
 
     private val processingLogTimer = Timer.builder("payment_stage_seconds")
+        .tag("component", "provider")
         .tag("account", accountName)
         .tag("stage", "log_processing")
         .register(meterRegistry)
@@ -122,9 +131,8 @@ class PaymentExternalSystemAdapterImpl(
         return properties.averageProcessingTime.toMillis()
     }
 
-    private fun observeProcessingMs(durationMs: Long) {
+    private fun observeSuccessfulCall(durationMs: Long) {
         if (durationMs <= 0) return
-        processingTimer.record(durationMs, TimeUnit.MILLISECONDS)
 
         while (true) {
             val previous = observedProcessingMs.get()
@@ -167,89 +175,89 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
+        var retryReason: String? = null
         var attempt = 0
         while (true) {
             attempt++
             val transactionId = UUID.randomUUID()
 
-            // Вне зависимости от исхода оплаты важно отметить, что она была отправлена.
-            // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-            val submissionLogStart = now()
-            try {
-                paymentESService.update(paymentId) {
-                    it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-                }
-            } catch (e: Exception) {
-                logger.error("[$accountName] Failed to log submission for payment $paymentId, txId: $transactionId", e)
-            } finally {
-                submissionLogTimer.record(now() - submissionLogStart, TimeUnit.MILLISECONDS)
+            val latestStartMs = deadline - SUBMISSION_RESERVE_MS - MIN_ATTEMPT_BUDGET_MS
+            val slotWaitStart = now()
+            val acquired = parallelLimiter.tryAcquire((latestStartMs - now()).coerceAtLeast(0), TimeUnit.MILLISECONDS)
+            slotWaitTimer.record(now() - slotWaitStart, TimeUnit.MILLISECONDS)
+            if (!acquired) {
+                logTerminalFailure(paymentId, null, "Deadline waiting for provider slot", "deadline")
+                return
             }
 
-            logger.info("[$accountName] Submit: $paymentId , txId: $transactionId, attempt: $attempt")
-
-            val rateWaitStart = now()
-            rateLimiter.tickBlocking()
-            rateWaitTimer.record(now() - rateWaitStart, TimeUnit.MILLISECONDS)
-
-            val slotWaitStart = now()
-            parallelLimiter.acquire()
-            slotWaitTimer.record(now() - slotWaitStart, TimeUnit.MILLISECONDS)
-
             val outcome = try {
-                callProvider(paymentId, amount, transactionId, deadline)
+                submitAttempt(paymentId, amount, transactionId, paymentStartedAt, deadline, retryReason, attempt)
             } finally {
                 parallelLimiter.release()
             }
 
-            attemptCounter(attempt, if (outcome.success) "success" else "failed").increment()
-
             if (outcome.success) {
-                logger.warn(
-                    "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
-                            "succeeded: true, attempt: $attempt, message: ${outcome.reason}"
-                )
+                if (attempt > 1) recoveredPayments.increment()
                 finish(paymentId, transactionId, true, outcome.reason, "success")
                 return
             }
 
-            logger.warn(
-                "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
-                        "succeeded: false, attempt: $attempt, retriable: ${outcome.retriable}, message: ${outcome.reason}"
-            )
-
+            logger.warn("[$accountName] Attempt $attempt failed for payment $paymentId: ${outcome.kind}")
             if (attempt >= maxAttempts || !outcome.retriable) {
                 finish(paymentId, transactionId, false, outcome.reason, outcome.kind)
                 return
             }
 
-            // Пауза перед повтором: `Retry-After` от ПС либо линейный backoff.
-            val backoffMs = outcome.retryAfterMs
-                ?: minOf(retryBackoffMs * attempt, RETRY_BACKOFF_MAX_MS)
-
-            // Повтор имеет смысл, только если остатка бюджета хватает ещё на один вызов ПС.
+            val backoffMs = outcome.retryAfterMs ?: minOf(retryBackoffMs * attempt, RETRY_BACKOFF_MAX_MS)
             if (remainingBudgetMs(deadline) <= observedProcessingMs.get() + backoffMs) {
-                logger.warn(
-                    "[$accountName] No budget for retry for payment $paymentId: " +
-                            "remaining=${remainingBudgetMs(deadline)} ms, needed=${observedProcessingMs.get() + backoffMs} ms"
-                )
                 finish(paymentId, transactionId, false, "${outcome.reason} (no budget for retry)", outcome.kind)
                 return
             }
-
-            retryCounter(outcome.kind).increment()
-            logger.warn("[$accountName] Retrying payment $paymentId after ${backoffMs} ms, reason: ${outcome.kind}")
+            retryReason = outcome.kind
             if (backoffMs > 0) Thread.sleep(backoffMs)
         }
+    }
+
+    private fun submitAttempt(
+        paymentId: UUID,
+        amount: Int,
+        transactionId: UUID,
+        paymentStartedAt: Long,
+        deadline: Long,
+        retryReason: String?,
+        attempt: Int,
+    ): AttemptOutcome {
+        val submissionLogStart = now()
+        try {
+            paymentESService.update(paymentId) {
+                it.logSubmission(true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
+        } catch (e: Exception) {
+            logger.error("[$accountName] Failed to log submission for payment $paymentId, txId: $transactionId", e)
+        } finally {
+            submissionLogTimer.record(now() - submissionLogStart, TimeUnit.MILLISECONDS)
+        }
+
+        val rateWaitStart = now()
+        val allowed = rateLimiter.tryAcquireUntil(deadline - SUBMISSION_RESERVE_MS - MIN_ATTEMPT_BUDGET_MS)
+        rateWaitTimer.record(now() - rateWaitStart, TimeUnit.MILLISECONDS)
+        val remainingMs = remainingBudgetMs(deadline)
+        if (!allowed || remainingMs < MIN_ATTEMPT_BUDGET_MS) {
+            return AttemptOutcome(false, "Deadline before HTTP call", false, "deadline")
+        }
+        val attemptLimit = if (attempt < maxAttempts) attemptTimeoutMs else CALL_TIMEOUT_CEILING_MS
+        val callBudgetMs = minOf(remainingMs, attemptLimit, CALL_TIMEOUT_CEILING_MS)
+        if (retryReason != null) retryCounter(retryReason).increment()
+        val outcome = callProvider(paymentId, amount, transactionId, callBudgetMs)
+        attemptCounter(attempt, if (outcome.success) "success" else "failed").increment()
+        return outcome
     }
 
     /**
      * Один вызов платёжной системы. Время вызова ограничено остатком дедлайна клиента,
      * чтобы зависшее соединение не съело бюджет и не удерживало слот.
      */
-    private fun callProvider(paymentId: UUID, amount: Int, transactionId: UUID, deadline: Long): AttemptOutcome {
-        val callBudgetMs = remainingBudgetMs(deadline)
-            .coerceIn(MIN_ATTEMPT_BUDGET_MS, CALL_TIMEOUT_CEILING_MS)
-
+    private fun callProvider(paymentId: UUID, amount: Int, transactionId: UUID, callBudgetMs: Long): AttemptOutcome {
         val request = Request.Builder().run {
             url(
                 "http://$paymentProviderHostPort/external/process" +
@@ -267,22 +275,19 @@ class PaymentExternalSystemAdapterImpl(
                 .newCall(request)
                 .execute()
                 .use { response ->
-                    observeProcessingMs(now() - sentAt)
-                    interpret(response)
+                    interpret(response).also { if (it.success) observeSuccessfulCall(now() - sentAt) }
                 }
         } catch (e: SocketTimeoutException) {
-            observeProcessingMs(now() - sentAt)
-            AttemptOutcome(false, "Request timeout.", retriable = true, kind = "timeout")
+            AttemptOutcome(false, "Request timeout.", retriable = true, kind = "timeout", retryAfterMs = 0)
         } catch (e: InterruptedIOException) {
-            observeProcessingMs(now() - sentAt)
-            AttemptOutcome(false, "Request timeout (call deadline).", retriable = true, kind = "timeout")
+            AttemptOutcome(false, "Request timeout (call deadline).", retriable = true, kind = "timeout", retryAfterMs = 0)
         } catch (e: IOException) {
-            observeProcessingMs(now() - sentAt)
             AttemptOutcome(false, e.message ?: e.javaClass.simpleName, retriable = true, kind = "io")
         } catch (e: Exception) {
-            observeProcessingMs(now() - sentAt)
             logger.error("[$accountName] Unexpected payment failure for txId: $transactionId, payment: $paymentId", e)
             AttemptOutcome(false, e.message ?: e.javaClass.simpleName, retriable = false, kind = "unexpected")
+        } finally {
+            processingTimer.record(now() - sentAt, TimeUnit.MILLISECONDS)
         }
     }
 

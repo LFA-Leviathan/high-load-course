@@ -36,8 +36,11 @@ class PaymentAccountsConfig {
     @Value("\${payment.expected-processing-time-ms}")
     var expectedProcessingTimeMs: Long = 0L
 
-    @Value("\${payment.retry.max-attempts:2}")
-    var maxAttempts: Int = 2
+    @Value("\${payment.retry.max-attempts}")
+    var maxAttempts: Int = 4
+
+    @Value("\${payment.retry.attempt-timeout-ms}")
+    var attemptTimeoutMs: Long = 1250L
 
     @Value("\${payment.retry.backoff-ms:100}")
     var retryBackoffMs: Long = 100L
@@ -75,6 +78,7 @@ class PaymentAccountsConfig {
                     expectedProcessingTimeMs,
                     maxAttempts,
                     retryBackoffMs,
+                    attemptTimeoutMs,
                 )
             }
     }

@@ -1,0 +1,338 @@
+{
+  "schemaVersion": 40,
+  "uid": "hw07-acc7",
+  "title": "HW-07 · acc-7",
+  "timezone": "browser",
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Повторные вызовы провайдера",
+      "type": "timeseries",
+      "description": "Число отправленных повторных запросов с момента запуска приложения, по причине повтора.",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "placement": "bottom",
+          "displayMode": "list",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (payment_retry_total{account=\"acc-7\",shop=~\"$service\"})",
+          "legendFormat": "{{reason}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Платежи, спасённые повторной попыткой",
+      "type": "timeseries",
+      "description": "Каждый платёж учитывается один раз, если повторная попытка вернула успех.",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "placement": "bottom",
+          "displayMode": "list",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(payment_recovered_total{account=\"acc-7\",shop=~\"$service\"})",
+          "legendFormat": "Успешно после повтора",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Время HTTP-вызова провайдера",
+      "type": "timeseries",
+      "description": "Включает вызовы, завершившиеся тайм-аутом. Окно расчёта — одна минута.",
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 12,
+        "h": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "placement": "bottom",
+          "displayMode": "list",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(payment_processing_seconds_bucket{account=\"acc-7\",shop=~\"$service\"}[1m])))",
+          "legendFormat": "p50",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(payment_processing_seconds_bucket{account=\"acc-7\",shop=~\"$service\"}[1m])))",
+          "legendFormat": "p95",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(payment_processing_seconds_bucket{account=\"acc-7\",shop=~\"$service\"}[1m])))",
+          "legendFormat": "p99",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Завершённые попытки по номеру и исходу",
+      "type": "timeseries",
+      "description": "Накопительные счётчики показывают, какую прибавку даёт каждая следующая попытка.",
+      "gridPos": {
+        "x": 12,
+        "y": 9,
+        "w": 12,
+        "h": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "placement": "bottom",
+          "displayMode": "list",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (attempt, outcome) (payment_attempts_total{account=\"acc-7\",shop=~\"$service\"})",
+          "legendFormat": "№{{attempt}} · {{outcome}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Результат теста Bombardier",
+      "type": "stat",
+      "description": "Изменение счётчиков Bombardier относительно начала выбранного интервала. Дубли двух scrape-целей исключены.",
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 12,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "locale",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (testOutcome) (max without(instance, job) (test_duration_count{service=~\"$service\",testOutcome=~\"SUCCESS|FAIL\"})) - (sum by (testOutcome) (max without(instance, job) (test_duration_count{service=~\"$service\",testOutcome=~\"SUCCESS|FAIL\"} offset ${__range_s}s)) or (sum by (testOutcome) (max without(instance, job) (test_duration_count{service=~\"$service\",testOutcome=~\"SUCCESS|FAIL\"})) * 0))",
+          "legendFormat": "{{testOutcome}}",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Доход и расходы за тест",
+      "type": "stat",
+      "description": "Изменение счётчиков Bombardier относительно начала выбранного интервала. Дубли двух scrape-целей исключены.",
+      "gridPos": {
+        "x": 12,
+        "y": 18,
+        "w": 12,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "locale",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum (max without(instance, job) (payments_amount_total{service=~\"$service\"})) - (sum (max without(instance, job) (payments_amount_total{service=~\"$service\"} offset ${__range_s}s)) or (sum (max without(instance, job) (payments_amount_total{service=~\"$service\"})) * 0))",
+          "legendFormat": "Доход",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        },
+        {
+          "expr": "sum (max without(instance, job) (external_amount_total{service=~\"$service\",accountName=\"acc-7\"})) - (sum (max without(instance, job) (external_amount_total{service=~\"$service\",accountName=\"acc-7\"} offset ${__range_s}s)) or (sum (max without(instance, job) (external_amount_total{service=~\"$service\",accountName=\"acc-7\"})) * 0))",
+          "legendFormat": "Расходы",
+          "refId": "B",
+          "range": false,
+          "instant": true
+        }
+      ]
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "type": "query",
+        "name": "service",
+        "label": "Сервис",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "refresh": 1,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "query": {
+          "query": "label_values(test_duration_count, service)",
+          "refId": "service"
+        }
+      }
+    ]
+  }
+}
